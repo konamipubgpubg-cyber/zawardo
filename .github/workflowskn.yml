@@ -1,0 +1,619 @@
+name: Eden Android - Floating Pause/Resume + L Toggle + Swipe Camera
+
+on:
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: "Product flavor ('genshinSpoof' = the 'Eden Optimized' build)"
+        required: true
+        default: "genshinSpoof"
+        type: choice
+        options:
+          - genshinSpoof
+          - mainline
+          - legacy
+      nightly:
+        description: 'Build as Nightly (app name gets " Nightly" suffix)'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  EDEN_REPO: https://github.com/eden-emulator/mirror.git
+  EDEN_COMMIT: 37fe9119526c03ca064166130cc983c55b9a9e86
+
+jobs:
+  build-eden:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/share/powershell /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Clone Eden at pinned commit
+        run: |
+          git clone "$EDEN_REPO" eden
+          cd eden
+          git checkout "$EDEN_COMMIT"
+          git submodule update --init --recursive
+          git rev-parse HEAD
+
+      - name: Patch Eden - Floating Pause/Resume + L Toggle + Swipe Camera
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import sys
+
+          root = pathlib.Path("eden")
+
+          activity = root / \
+              "src/android/app/src/main/java/org/yuzu/yuzu_emu/activities/EmulationActivity.kt"
+
+          native_lib = root / \
+              "src/android/app/src/main/java/org/yuzu/yuzu_emu/NativeLibrary.kt"
+
+          button_file = root / \
+              "src/android/app/src/main/java/org/yuzu/yuzu_emu/overlay/InputOverlayDrawableButton.kt"
+
+          overlay_file = root / \
+              "src/android/app/src/main/java/org/yuzu/yuzu_emu/overlay/InputOverlay.kt"
+
+          src = activity.read_text()
+          native_src = native_lib.read_text() if native_lib.exists() else ""
+          button_src = button_file.read_text()
+          overlay_src = overlay_file.read_text()
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  sys.exit(
+                      f"PATCH FAILED - anchor not unique/found ({count}x): {label}"
+                  )
+              return text.replace(old, new, 1)
+
+          # ============================================================
+          # PART 1: Floating Pause / Resume button
+          # ============================================================
+
+          if "pauseEmulation()" in native_src or "pauseEmulation()" in src:
+              pause_call = "NativeLibrary.pauseEmulation()"
+              unpause_call = "NativeLibrary.unpauseEmulation()"
+          elif "pauseEmulation" in src:
+              pause_call = "pauseEmulation()"
+              unpause_call = "unpauseEmulation()"
+          else:
+              pause_call = "emulationViewModel.isPaused.value = true"
+              unpause_call = "emulationViewModel.isPaused.value = false"
+
+          src = replace_once(
+              src,
+              "setContentView(binding.root)",
+              "setContentView(binding.root)\n"
+              "                    setupPauseResumeButton()",
+              "onCreate/setContentView",
+          )
+
+          helpers = f"""    private var fabPauseResume: com.google.android.material.floatingactionbutton.FloatingActionButton? = null
+              private var isEmulationPaused = false
+
+              private fun setupPauseResumeButton() {{
+                  val fab = com.google.android.material.floatingactionbutton.FloatingActionButton(this)
+                  fabPauseResume = fab
+
+                  val density = resources.displayMetrics.density
+                  val marginPx = (16 * density).toInt()
+
+                  val lp = android.widget.FrameLayout.LayoutParams(
+                      android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
+                      android.widget.FrameLayout.LayoutParams.WRAP_CONTENT
+                  ).apply {{
+                      gravity = android.view.Gravity.BOTTOM or android.view.Gravity.END
+                      setMargins(marginPx, marginPx, marginPx, marginPx)
+                  }}
+
+                  fab.layoutParams = lp
+                  fab.size =
+                      com.google.android.material.floatingactionbutton.FloatingActionButton.SIZE_MINI
+
+                  fab.setImageResource(android.R.drawable.ic_media_pause)
+                  fab.visibility = android.view.View.GONE
+
+                  fab.setOnClickListener {{
+                      if (!NativeLibrary.isRunning()) return@setOnClickListener
+
+                      if (isEmulationPaused) {{
+                          {unpause_call}
+                          isEmulationPaused = false
+                      }} else {{
+                          {pause_call}
+                          isEmulationPaused = true
+                      }}
+
+                      updatePauseResumeButtonIcon()
+                  }}
+
+                  val root = findViewById<android.view.ViewGroup>(android.R.id.content)
+                  root?.addView(fab)
+              }}
+
+              private fun updatePauseResumeButtonIcon() {{
+                  fabPauseResume?.setImageResource(
+                      if (isEmulationPaused)
+                          android.R.drawable.ic_media_play
+                      else
+                          android.R.drawable.ic_media_pause
+                  )
+              }}
+
+              private fun enableFullscreenImmersive() {{"""
+
+          src = replace_once(
+              src,
+              "private fun enableFullscreenImmersive() {",
+              helpers,
+              "enableFullscreenImmersive anchor",
+          )
+
+          src = replace_once(
+              src,
+              "nfcReader.startScanning()",
+              "updatePauseResumeButtonIcon()\n"
+              "                    nfcReader.startScanning()",
+              "onResume",
+          )
+
+          src = replace_once(
+              src,
+              "NativeLibrary.playTimeManagerStart()",
+              "NativeLibrary.playTimeManagerStart()\n\n"
+              "                  fabPauseResume?.visibility = android.view.View.VISIBLE\n"
+              "                  isEmulationPaused = false\n"
+              "                  updatePauseResumeButtonIcon()",
+              "onEmulationStarted",
+          )
+
+          src = replace_once(
+              src,
+              "emulationViewModel.setEmulationStopped(true)",
+              "emulationViewModel.setEmulationStopped(true)\n"
+              "                  fabPauseResume?.visibility = android.view.View.GONE\n"
+              "                  isEmulationPaused = false",
+              "onEmulationStopped",
+          )
+
+          src = replace_once(
+              src,
+              "override fun dispatchTouchEvent(event: MotionEvent): Boolean {",
+              """override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+                  fabPauseResume?.let { fab ->
+                      if (fab.visibility == android.view.View.VISIBLE) {
+                          val rect = android.graphics.Rect()
+                          fab.getGlobalVisibleRect(rect)
+
+                          if (rect.contains(
+                                  event.x.toInt(),
+                                  event.y.toInt()
+                              )
+                          ) {
+                              return super.dispatchTouchEvent(event)
+                          }
+                      }
+                  }""",
+              "dispatchTouchEvent anchor",
+          )
+
+          activity.write_text(src)
+
+          # ============================================================
+          # PART 2: L BUTTON TOGGLE
+          # ============================================================
+
+          old_touch_logic = """        if (isActionDown) {
+              if (!bounds.contains(xPosition, yPosition)) {
+                  return false
+              }
+              pressedState = true
+              trackId = pointerId
+              return true
+          }
+
+          if (isActionUp) {
+              if (trackId != pointerId) {
+                  return false
+              }
+              pressedState = false
+              trackId = -1
+              return true
+          }
+
+          return false"""
+
+          new_touch_logic = """        if (isActionDown) {
+              if (!bounds.contains(xPosition, yPosition)) {
+                  return false
+              }
+
+              if (button == NativeButton.L) {
+                  // L is a toggle button.
+                  //
+                  // First tap  -> L pressed / ON
+                  // Second tap -> L released / OFF
+                  //
+                  // Releasing the finger does NOT release L.
+                  pressedState = !pressedState
+                  trackId = -1
+                  return true
+              }
+
+              // Normal button behavior.
+              pressedState = true
+              trackId = pointerId
+              return true
+          }
+
+          if (isActionUp) {
+              if (trackId != pointerId) {
+                  return false
+              }
+
+              pressedState = false
+              trackId = -1
+              return true
+          }
+
+          return false"""
+
+          button_src = replace_once(
+              button_src,
+              old_touch_logic,
+              new_touch_logic,
+              "InputOverlayDrawableButton touch logic",
+          )
+
+          button_file.write_text(button_src)
+
+          # ============================================================
+          # PART 3: SWIPE CAMERA
+          # ============================================================
+          #
+          # The old R-Stick joystick is removed from the visual overlay.
+          # A swipe zone is created on the right side of the screen.
+          #
+          # Camera movement is VELOCITY based:
+          #
+          #   slow swipe -> small R-Stick value
+          #   fast swipe -> large R-Stick value
+          #
+          # Sensitivity is currently built into the velocity multiplier.
+          # A later patch can expose it as a user setting.
+          #
+
+          overlay_src = replace_once(
+              overlay_src,
+              """    private val moveThreshold = 20f
+              private val gridPaint = Paint().apply {""",
+              """    private val moveThreshold = 20f
+
+              // Swipe Camera state.
+              private var swipeCameraPointerId = -1
+              private var swipeCameraLastX = 0f
+              private var swipeCameraLastY = 0f
+              private var swipeCameraLastTime = 0L
+
+              // Camera sensitivity multiplier.
+              // The camera speed is still based on finger velocity.
+              private val swipeCameraSensitivity = 1.8f
+
+              // Reference finger speed in pixels/second.
+              // Faster movement approaches the maximum stick value.
+              private val swipeCameraReferenceSpeed = 900f
+
+              private val gridPaint = Paint().apply {""",
+              "Swipe Camera state fields",
+          )
+
+          # Add swipe processing helpers before playHaptics().
+          swipe_helpers = """    private fun isSwipeCameraArea(x: Float, y: Float): Boolean {
+              // Right 45% of the screen is the camera swipe area.
+              // Existing overlay controls still take priority.
+              return x >= width * 0.55f &&
+                  x >= 0f &&
+                  y >= 0f &&
+                  y <= height.toFloat()
+          }
+
+          private fun updateSwipeCamera(event: MotionEvent): Boolean {
+              val action = event.actionMasked
+
+              if (action == MotionEvent.ACTION_DOWN ||
+                  action == MotionEvent.ACTION_POINTER_DOWN
+              ) {
+                  val pointerIndex = event.actionIndex
+                  val pointerId = event.getPointerId(pointerIndex)
+                  val x = event.getX(pointerIndex)
+                  val y = event.getY(pointerIndex)
+
+                  if (swipeCameraPointerId == -1 &&
+                      isSwipeCameraArea(x, y) &&
+                      !isTouchInputConsumed(pointerId)
+                  ) {
+                      swipeCameraPointerId = pointerId
+                      swipeCameraLastX = x
+                      swipeCameraLastY = y
+                      swipeCameraLastTime = event.eventTime
+
+                      NativeInput.onOverlayJoystickEvent(
+                          if (NativeInput.getStyleIndex(0) == NpadStyleIndex.Handheld) 8 else 0,
+                          NativeAnalog.RStick,
+                          0f,
+                          0f
+                      )
+
+                      return true
+                  }
+              }
+
+              if (action == MotionEvent.ACTION_MOVE &&
+                  swipeCameraPointerId != -1
+              ) {
+                  var index = -1
+
+                  for (i in 0 until event.pointerCount) {
+                      if (event.getPointerId(i) == swipeCameraPointerId) {
+                          index = i
+                          break
+                      }
+                  }
+
+                  if (index >= 0) {
+                      val x = event.getX(index)
+                      val y = event.getY(index)
+
+                      val deltaTimeMs =
+                          (event.eventTime - swipeCameraLastTime).coerceAtLeast(1L)
+
+                      val deltaTimeSeconds = deltaTimeMs / 1000f
+
+                      val velocityX =
+                          (x - swipeCameraLastX) / deltaTimeSeconds
+
+                      val velocityY =
+                          (y - swipeCameraLastY) / deltaTimeSeconds
+
+                      var cameraX =
+                          (velocityX / swipeCameraReferenceSpeed) *
+                              swipeCameraSensitivity
+
+                      // Nintendo/Yuzu analog Y is inverted.
+                      // Swiping UP should move the camera UP.
+                      var cameraY =
+                          (-velocityY / swipeCameraReferenceSpeed) *
+                              swipeCameraSensitivity
+
+                      cameraX = cameraX.coerceIn(-1f, 1f)
+                      cameraY = cameraY.coerceIn(-1f, 1f)
+
+                      val playerIndex =
+                          if (NativeInput.getStyleIndex(0) == NpadStyleIndex.Handheld) 8 else 0
+
+                      NativeInput.onOverlayJoystickEvent(
+                          playerIndex,
+                          NativeAnalog.RStick,
+                          cameraX,
+                          cameraY
+                      )
+
+                      swipeCameraLastX = x
+                      swipeCameraLastY = y
+                      swipeCameraLastTime = event.eventTime
+
+                      return true
+                  }
+              }
+
+              if (action == MotionEvent.ACTION_UP ||
+                  action == MotionEvent.ACTION_POINTER_UP
+              ) {
+                  val pointerIndex = event.actionIndex
+                  val pointerId = event.getPointerId(pointerIndex)
+
+                  if (pointerId == swipeCameraPointerId) {
+                      val playerIndex =
+                          if (NativeInput.getStyleIndex(0) == NpadStyleIndex.Handheld) 8 else 0
+
+                      NativeInput.onOverlayJoystickEvent(
+                          playerIndex,
+                          NativeAnalog.RStick,
+                          0f,
+                          0f
+                      )
+
+                      swipeCameraPointerId = -1
+                      swipeCameraLastX = 0f
+                      swipeCameraLastY = 0f
+                      swipeCameraLastTime = 0L
+
+                      return true
+                  }
+              }
+
+              return false
+          }
+
+"""
+
+          overlay_src = replace_once(
+              overlay_src,
+              "    private fun playHaptics(event: MotionEvent) {",
+              swipe_helpers + "    private fun playHaptics(event: MotionEvent) {",
+              "insert Swipe Camera helpers",
+          )
+
+          # Run Swipe Camera BEFORE normal touchscreen forwarding.
+          # This prevents the swipe finger from being treated as a
+          # normal touchscreen/game touch.
+          overlay_src = replace_once(
+              overlay_src,
+              """        if (!BooleanSetting.TOUCHSCREEN.getBoolean()) {
+              return true
+          }
+
+          val pointerIndex = event.actionIndex""",
+              """        if (updateSwipeCamera(event)) {
+              return true
+          }
+
+          if (!BooleanSetting.TOUCHSCREEN.getBoolean()) {
+              return true
+          }
+
+          val pointerIndex = event.actionIndex""",
+              "Swipe Camera touch interception",
+          )
+
+          # Remove the old R-Stick joystick from the overlay.
+          # R-Stick is now controlled by the swipe camera area.
+          old_rstick_block = """                OverlayControl.STICK_R.id -> {
+                    overlayJoysticks.add(
+                        initializeOverlayJoystick(
+                            context,
+                            windowSize,
+                            R.drawable.joystick_range,
+                            R.drawable.joystick,
+                            R.drawable.joystick_depressed,
+                            NativeAnalog.RStick,
+                            NativeButton.RStick,
+                            data,
+                            position
+                        )
+                    )
+                }"""
+
+          new_rstick_block = """                OverlayControl.STICK_R.id -> {
+                    // R-Stick is replaced by Swipe Camera.
+                    // Keep the saved overlay configuration intact,
+                    // but do not create the old joystick UI.
+                }"""
+
+          overlay_src = replace_once(
+              overlay_src,
+              old_rstick_block,
+              new_rstick_block,
+              "replace R-Stick with Swipe Camera",
+          )
+
+          overlay_file.write_text(overlay_src)
+
+          print("PATCH OK")
+          print("Pause/Resume patched:", activity)
+          print("L Toggle patched:", button_file)
+          print("Swipe Camera patched:", overlay_file)
+          PY
+
+      - name: Verify patches
+        run: |
+          echo "=== Pause/Resume ==="
+          grep -n "fabPauseResume\|setupPauseResumeButton" \
+            eden/src/android/app/src/main/java/org/yuzu/yuzu_emu/activities/EmulationActivity.kt
+
+          echo ""
+          echo "=== L Toggle ==="
+          grep -n "button == NativeButton.L\|L is a toggle button" \
+            eden/src/android/app/src/main/java/org/yuzu/yuzu_emu/overlay/InputOverlayDrawableButton.kt
+
+          echo ""
+          echo "=== Swipe Camera ==="
+          grep -n \
+            "swipeCameraPointerId\|updateSwipeCamera\|isSwipeCameraArea\|Swipe Camera\|NativeAnalog.RStick" \
+            eden/src/android/app/src/main/java/org/yuzu/yuzu_emu/overlay/InputOverlay.kt
+
+          echo ""
+          echo "=== Git diff check ==="
+          cd eden
+          git diff --check
+          git diff --stat
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK components
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+
+          "$SDKMANAGER" --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;26.1.10909125" \
+            "cmake;3.22.1"
+
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+      - name: Install glslangValidator
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools
+
+          which glslangValidator
+          glslangValidator --version
+
+      - name: Gradle settings
+        run: |
+          mkdir -p "$HOME/.gradle"
+
+          printf '%s\n' \
+            'org.gradle.jvmargs=-Xmx8g -XX:+UseParallelGC' \
+            'org.gradle.daemon=false' \
+            'org.gradle.caching=true' \
+            > "$HOME/.gradle/gradle.properties"
+
+      - name: Build optimized APK
+        working-directory: eden/src/android
+        run: |
+          FLAVOR_CAP="$(echo '${{ inputs.flavor }}' | sed 's/^\(.\)/\U\1/')"
+
+          NIGHTLY_FLG=""
+
+          if [ "${{ inputs.nightly }}" = "true" ]; then
+            NIGHTLY_FLG="-Pnightly=true"
+          fi
+
+          chmod +x gradlew
+
+          ./gradlew --console=plain --stacktrace \
+            ":app:assemble${FLAVOR_CAP}Release" ${NIGHTLY_FLG} || {
+              echo "=== BUILD FAILED - PRINTING LOGS ==="
+
+              find . \
+                -name "*.log" \
+                -o -name "*error*.txt" \
+                | xargs -r cat
+
+              exit 1
+            }
+
+      - name: Locate APK
+        id: apk
+        run: |
+          APK="$(find eden/src/android/app/build/outputs/apk \
+            -name '*.apk' | head -n1)"
+
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+
+          ls -lh "$APK"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eden-${{ inputs.flavor }}-release-l-toggle-swipe-camera
+          path: ${{ steps.apk.outputs.apk }}
+          if-no-files-found: error
+          retention-days: 30
